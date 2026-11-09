@@ -3,7 +3,7 @@
 CWave is licensed under the GNU General Public License
 version 3 or (at your option) any later version.
 
-CWave Terminal Music Player
+CWave Terminal Music Player Version 1.0
   mpv        -> playback
   cava       -> audio visualizer
   chafa      -> album/track cover: sixel / kitty / iTerm image, or Unicode symbols
