@@ -52,6 +52,9 @@ Built around **mpv** (playback), **cava** (visualizer), and **chafa** (covers). 
 - Virtual **Stream Playlists** folder; playlists saved as JSON
 - Background URL resolve / preload for faster track changes
 - Requires **yt-dlp** which must be installed separately.
+```
+Users are solely responsible for their use of this feature and must ensure that it complies with applicable copyright laws and the platform's Terms of Service. CWave does not grant permission to download, reproduce, or redistribute copyrighted content.*
+```
 
 ### Config
 - Single file: `~/.config/cwave/config`
