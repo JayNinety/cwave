@@ -1,7 +1,7 @@
 # CWave
 
 Terminal music player for Linux — local files, album covers, a live visualizer, timed lyrics, and optional streaming.
-
+![Alt Text](https://github.com/JayNinety/cwave/blob/screenshots/1.png?raw=true)
 Built around **mpv** (playback), **cava** (visualizer), and **chafa** (covers). The UI is drawn with ANSI escapes in the terminal; no GUI toolkit.
 
 ```
