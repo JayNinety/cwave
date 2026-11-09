@@ -98,7 +98,7 @@ loop = r
 playlists_name = Stream Playlists
 # Single videos/tracks you add (a plain video URL instead of a playlist URL) are collected
 # in one playlist with this name, inside the folder above.
-single_tracks_name = Saved Tracks
+single_tracks_name = Single Tracks
 # Streamed covers are 16:9 thumbnails. true = crop them to a centered square (1:1).
 square_covers = true
 # How many upcoming tracks (from the current playlist / folder) to pre-resolve with yt-dlp.
