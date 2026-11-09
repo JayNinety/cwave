@@ -48,10 +48,10 @@ Built around **mpv** (playback), **cava** (visualizer), and **chafa** (covers). 
 - Disk cache under `~/.cache/cwave/lyrics/`
 
 ### Streaming (optional)
-- Add Legitimate YouTube / YouTube Music playlist or video URLs from your own channel, respecting the [Terms of Service](https://www.youtube.com/t/terms) of the platform.
+- Add YouTube / YouTube Music playlist or video URLs for content you own or are authorized to access, while respecting the platform's [Terms of Service](https://www.youtube.com/t/terms).
 - Virtual **Stream Playlists** folder; playlists saved as JSON
 - Background URL resolve / preload for faster track changes
-- Requires **yt-dlp** when you use this feature
+- Requires **yt-dlp** which must be installed separately.
 
 ### Config
 - Single file: `~/.config/cwave/config`
