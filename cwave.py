@@ -3,7 +3,7 @@
 CWave is licensed under the GNU General Public License
 version 3 or (at your option) any later version.
 
-CWave Terminal Music Player Version 1.1
+CWave Terminal Music Player Version 1.2
   mpv        -> playback
   cava       -> audio visualizer
   chafa      -> album/track cover: sixel / kitty / iTerm image, or Unicode symbols
@@ -33,6 +33,7 @@ import configparser
 import unicodedata
 import urllib.request
 import urllib.parse
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from io import BytesIO
@@ -1945,7 +1946,7 @@ def _entry_start(entry: dict):
         v = entry.get(k)
         if v is not None:
             try:
-                return int(float(v))
+                return float(v)
             except (TypeError, ValueError):
                 continue
     return None
@@ -1964,7 +1965,7 @@ def _track_timing_ok(track: dict) -> bool:
     return _timing_ok((_entry_start(e) or 0) for e in timed if isinstance(e, dict))
 
 
-def _liriqo_track_to_lines(track: dict) -> tuple[list[dict], bool]:
+def _liriqo_track_to_lines(track: dict, unit: float = 1.0) -> tuple[list[dict], bool]:
     """Convert a LiriQo track object into our line list + has_word_sync flag.
 
     Word token text is kept as returned (including trailing spaces). Joining
@@ -1982,7 +1983,7 @@ def _liriqo_track_to_lines(track: dict) -> tuple[list[dict], bool]:
     for entry in timed:
         if not isinstance(entry, dict):
             continue
-        start_ms = _entry_start(entry) or 0
+        start_ms = int(round((_entry_start(entry) or 0) * unit))
         text = (entry.get("text") or "").strip()
         if not text and not entry.get("words"):
             continue
@@ -2011,10 +2012,8 @@ def _liriqo_track_to_lines(track: dict) -> tuple[list[dict], bool]:
                         words.append({"start_ms": start_ms, "text": w_txt})
                         plain_parts.append(w_txt)
                     continue
-                try:
-                    w_ms = int(w.get("start") if w.get("start") is not None else start_ms)
-                except (TypeError, ValueError):
-                    w_ms = start_ms
+                _ws = _entry_start(w)
+                w_ms = int(round(_ws * unit)) if _ws is not None else start_ms
                 words.append({"start_ms": w_ms, "text": w_txt})
                 plain_parts.append(w_txt)
             if words:
@@ -2521,12 +2520,157 @@ def _pick_liriqo_track(payload: dict, preferred: str) -> dict | None:
     return plain[0][2] if plain else tracks[0]
 
 
+LYRICS_API_BASES = (
+    "https://api.liriqo-alfarrizi.my.id/v1",
+    "https://api.liriqo-alfarrizi.workers.dev/v1",      # base URL given in the LiriQo README
+)
+LYRICS_MISSING_TTL = 12 * 3600       # "no lyrics found" is trusted for 12 h, then asked again
+_API_FAIL = object()
+
+
+def _liriqo_get(url: str, params: dict, headers: dict, timeout: float):
+    """GET + JSON. Returns the decoded JSON, or _API_FAIL on any network/HTTP/JSON problem."""
+    try:
+        req = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return _API_FAIL
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return _API_FAIL
+
+
+def _clean_for_search(text: str, artist: bool = False) -> str:
+    """Strip video-title noise ("(Official Video)", "[Lyrics]", "- Topic", "VEVO", ...)."""
+    t = str(text or "")
+    t = re.sub(r"\s*[\(\[][^)\]]*(official|video|audio|lyric|visuali[sz]er|remaster|\bhd\b|\bhq\b|\b4k\b|\bmv\b)"
+               r"[^)\]]*[\)\]]", "", t, flags=re.I)
+    t = re.sub(r"\s*[-–|]\s*(official|lyrics?|audio|video|topic)\b.*$", "", t, flags=re.I)
+    if artist:
+        t = re.sub(r"\s*(vevo|- topic)$", "", t, flags=re.I)
+    return re.sub(r"\s+", " ", t).strip() or str(text or "").strip()
+
+
+def lyrics_cache_usable(data) -> bool:
+    """A cached lyrics dict that can be shown as-is (not broken, not an old "not found")."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("bad_timing") or data.get("transient"):
+        return False
+    lines = data.get("lines") or []
+    if data.get("synced") and not _timing_ok(ln.get("start_ms", 0) for ln in lines):
+        return False
+    if data.get("missing"):
+        try:
+            return time.time() - float(data.get("checked") or 0) < LYRICS_MISSING_TTL
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+_LY_LOCK = threading.Lock()
+_LY_INFLIGHT = {}
+
+
+def get_lyrics(title, artist, album, duration, sync, force=False):
+    """Cache first, then LiriQo (4 attempts). One fetch per track at a time, whoever asks.
+    Returns the lyrics dict, or None when the API could not be reached (nothing is cached then)."""
+    key = _lyrics_cache_key(title, artist, duration)
+    if not force:
+        c = load_cached_lyrics(key)
+        if lyrics_cache_usable(c):
+            return c
+    with _LY_LOCK:
+        ev = _LY_INFLIGHT.get(key)
+        owner = ev is None
+        if owner:
+            ev = _LY_INFLIGHT[key] = threading.Event()
+    if not owner:                                      # someone (e.g. the prefetcher) is on it
+        ev.wait(150)
+        c = load_cached_lyrics(key)
+        return c if lyrics_cache_usable(c) else None
+    try:
+        data = fetch_liriqo_lyrics(title, artist, album, duration, preferred_sync=sync)
+        if data is not None:
+            data.setdefault("checked", time.time())
+            save_cached_lyrics(key, data)
+        return data
+    finally:
+        with _LY_LOCK:
+            _LY_INFLIGHT.pop(key, None)
+        ev.set()
+
+
+class LyricsPrefetcher:
+    """Background worker that fills the lyrics cache for the other tracks of the folder /
+    playlist being played (same idea as the yt-dlp stream preload). Gentle: one request chain
+    at a time, short pause between tracks, stops for a while if the API is unreachable."""
+
+    def __init__(self, sync_getter):
+        self._sync = sync_getter
+        self._cv = threading.Condition()
+        self._jobs = deque()
+        self._done = set()
+        self._fails = {}
+        self._stop = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def schedule(self, entries):
+        with self._cv:
+            self._jobs.clear()
+            self._jobs.extend(entries)
+            self._cv.notify()
+
+    def stop(self):
+        with self._cv:
+            self._stop = True
+            self._jobs.clear()
+            self._cv.notify()
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while not self._jobs and not self._stop:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                entry = self._jobs.popleft()
+            try:
+                self._one(entry)
+            except Exception:
+                pass
+            time.sleep(0.6)
+
+    def _one(self, entry):
+        meta = stream_metadata(entry) if isinstance(entry, StreamEntry) else get_metadata(entry)
+        title = (meta.get("title") or "").strip()
+        artist = (meta.get("artist") or "").strip()
+        if not title or not artist or artist.lower() == "unknown":
+            return
+        dur = meta.get("duration") or 0
+        key = _lyrics_cache_key(title, artist, dur)
+        if key in self._done or self._fails.get(key, 0) >= 2:
+            return
+        if lyrics_cache_usable(load_cached_lyrics(key)):
+            self._done.add(key)
+            return
+        data = get_lyrics(title, artist, (meta.get("album") or "").strip(), dur, self._sync())
+        if data is None:                               # API down: back off, retry on a later schedule
+            self._fails[key] = self._fails.get(key, 0) + 1
+            with self._cv:
+                self._jobs.clear()
+            time.sleep(30)
+        else:
+            self._done.add(key)
+
+
 def fetch_liriqo_lyrics(
     title: str,
     artist: str,
     album: str = "",
     duration: float | int | None = None,
     preferred_sync: str = "word",
+    attempts: int = 4,
 ) -> dict | None:
     """Query LiriQo (multi-provider). Returns a JSON-ready dict or None.
 
@@ -2549,62 +2693,78 @@ def fetch_liriqo_lyrics(
 
     preferred_sync = _normalize_sync_pref(preferred_sync)
 
-    base = "https://api.liriqo-alfarrizi.my.id/v1/lyrics"
     headers = {
         "User-Agent": "CWave/1.0 (https://github.com/cwave; terminal music player)",
         "Accept": "application/json",
     }
-
-    params: dict = {
-        "title": title,
-        "artist": artist,
-        "fast": "1",
-    }
-    if album:
-        params["album"] = album
+    dur = None
     try:
-        if duration and float(duration) > 0:
+        if duration and float(duration) > 0 and 1 <= int(round(float(duration))) <= 3600:
             dur = int(round(float(duration)))
-            if 1 <= dur <= 3600:
-                params["duration"] = dur
     except (TypeError, ValueError):
         pass
 
-    track = None
-    for attempt in range(2):
-        # 2nd attempt: no "fast" mode, so slower providers with real timing can answer too
-        prm = dict(params)
-        if attempt:
-            prm.pop("fast", None)
-        try:
-            q = urllib.parse.urlencode(prm)
-            req = urllib.request.Request(f"{base}?{q}", headers=headers)
-            with urllib.request.urlopen(req, timeout=20 if not attempt else 40) as resp:
-                if resp.status != 200:
-                    continue
-                payload = json.loads(resp.read().decode("utf-8", "replace"))
-        except Exception:
-            continue
+    def prm(**kw):
+        d = {k: v for k, v in kw.items() if v not in (None, "")}
+        return d
+
+    ctitle, cartist = _clean_for_search(title), _clean_for_search(artist, artist=True)
+    # Each attempt changes something (endpoint, parameters), so one flaky provider
+    # path / one wrong tag cannot fail all of them. (base index, endpoint, params)
+    plans = [
+        (0, "lyrics", prm(title=title, artist=artist, album=album, duration=dur, fast="1")),
+        (1, "lyrics", prm(title=title, artist=artist, duration=dur)),
+        (0, "lyrics", prm(title=ctitle, artist=cartist)),
+        (1, "lyrics", prm(Q=f"{ctitle} {cartist}")),
+    ][:max(1, int(attempts))]
+
+    best = fallback = None
+    responses = 0
+    for i, (bi, ep, params) in enumerate(plans):
+        if i:
+            time.sleep(min(0.8 + 0.6 * i, 2.5))
+        payload = _liriqo_get(f"{LYRICS_API_BASES[bi]}/{ep}", params, headers, 20 if i == 0 else 25)
+        if payload is _API_FAIL:
+            continue                                   # network / HTTP / JSON problem
+        responses += 1
         if not isinstance(payload, dict) or payload.get("error"):
             continue
         cand = _pick_liriqo_track(payload, preferred_sync)
-        if not isinstance(cand, dict):
+        if not isinstance(cand, dict) or not (cand.get("timed") or cand.get("plain")
+                                              or cand.get("instrumental")):
             continue
-        if track is None:
-            track = cand
         if _track_timing_ok(cand):
-            track = cand
+            best = cand
             break
-    if not isinstance(track, dict):
-        return None
+        if fallback is None:
+            fallback = cand                            # claims timing but has none
+    track = best or fallback
+    if track is None:
+        if responses == 0:
+            return None                                # API unreachable: caller must NOT cache this
+        return {
+            "source": "liriqo", "provider": None, "sync_level": "plain",
+            "instrumental": False, "synced": False, "has_word_sync": False,
+            "plain": None, "lines": [], "missing": True, "checked": time.time(),
+        }
     bad_timing = not _track_timing_ok(track)
     if bad_timing:
         track = {**track, "timed": []}                 # keep only its plain text
 
+    # Some providers give seconds instead of milliseconds: detect it from the song length.
+    unit = 1.0
+    try:
+        starts = [_entry_start(e) for e in (track.get("timed") or []) if isinstance(e, dict)]
+        starts = [x for x in starts if x is not None]
+        if dur and dur >= 30 and starts and 0 < max(starts) <= dur * 1.5:
+            unit = 1000.0
+    except Exception:
+        pass
+
     sync_level = (track.get("syncLevel") or "").lower() or "line"
     provider = track.get("provider") or track.get("upstreamProvider")
 
-    lines, has_word = _liriqo_track_to_lines(track)
+    lines, has_word = _liriqo_track_to_lines(track, unit)
     plain = track.get("plain")
     if isinstance(plain, str):
         plain = plain.strip() or None
@@ -2625,6 +2785,7 @@ def fetch_liriqo_lyrics(
             "plain": None,
             "lines": [],
             "missing": not instrumental,
+            "checked": time.time(),
         }
 
     synced = bool(lines)
@@ -2882,7 +3043,9 @@ class Player:
         self.lyrics_visible = False # right panel shows lyrics instead of file list
         self.lyrics_fullscreen = False  # entire screen is lyrics only
         self._lyrics_key = None     # cache key of the currently loaded lyrics
-        self._lyrics_fetching = False
+        self._lyrics_fetching = None   # cache key of the fetch in flight (None = idle)
+        self.lyrics_prefetch_count = num(ly, "prefetch_count", 25, 0, 500)
+        self._lyrics_prefetcher = LyricsPrefetcher(lambda: self.lyrics_sync)
         self._romaji_engine = None  # lazy pykakasi instance
         self.lyrics_scroll = 0      # display-row offset into the rendered lyric buffer
         self.lyrics_scroll_manual = False  # user scrolled; pause autoscroll until reset
@@ -3261,6 +3424,7 @@ method = pulse
         self.lyrics_scroll_manual = False
         if self.enable_lyrics:
             self._start_lyrics_fetch()
+            self._schedule_lyrics_prefetch()
 
         # Fallback resume seek if file-loaded event is slow/missing
         if self._pending_resume is not None:
@@ -3574,63 +3738,106 @@ method = pulse
         threading.Thread(target=work, daemon=True).start()
 
     # --------------------------------------------------------------- lyrics
-    def _start_lyrics_fetch(self):
-        """Load from cache or fetch from LiriQo in a background thread."""
+    def _start_lyrics_fetch(self, force=False) -> bool:
+        """Show cached lyrics, or fetch them (4 attempts) in a background thread.
+        Returns False when the track has no usable title/artist."""
         if not self.enable_lyrics or not self.playing or not self.meta:
-            return
+            return False
         title = (self.meta.get("title") or "").strip()
         artist = (self.meta.get("artist") or "").strip()
         if not title or not artist or artist.lower() in ("unknown", ""):
-            return
+            return False
         album = (self.meta.get("album") or "").strip()
         duration = self.meta.get("duration") or 0
         key = _lyrics_cache_key(title, artist, duration)
         self._lyrics_key = key
 
-        # Instant cache hit
-        cached = load_cached_lyrics(key)
-        if cached is not None:
-            _cl = cached.get("lines") or []
-            if cached.get("bad_timing") or (
-                    cached.get("synced") and not _timing_ok(ln.get("start_ms", 0) for ln in _cl)):
-                cached = None                          # broken cache (no timestamps): fetch again
-        if cached is not None:
-            self.lyrics = self._apply_romaji(strip_translation_lines(cached, title, artist))
-            if self.lyrics_visible or self.lyrics_fullscreen:
-                self.full_dirty = True
-            return
+        if not force:
+            cached = load_cached_lyrics(key)
+            if lyrics_cache_usable(cached):            # broken / stale caches are fetched again
+                self.lyrics = self._apply_romaji(strip_translation_lines(cached, title, artist))
+                if self.lyrics_visible or self.lyrics_fullscreen:
+                    self.full_dirty = True
+                return True
 
-        if self._lyrics_fetching:
-            return
-        self._lyrics_fetching = True
+        self._lyrics_fetching = key
         playing_snapshot = self.playing
 
         def work():
+            data = None
             try:
-                data = fetch_liriqo_lyrics(
-                    title, artist, album, duration, preferred_sync=self.lyrics_sync,
-                )
-                if data is None:
-                    # Negative cache so we don't hammer the API every track change
-                    data = {
-                        "source": "liriqo",
-                        "instrumental": False,
-                        "synced": False,
-                        "has_word_sync": False,
-                        "plain": None,
-                        "lines": [],
-                        "missing": True,
-                    }
-                save_cached_lyrics(key, data)
-                # Only apply if the user is still on the same track
-                if self.playing is playing_snapshot and self._lyrics_key == key:
-                    self.lyrics = self._apply_romaji(strip_translation_lines(data, title, artist))
-                    if self.lyrics_visible or self.lyrics_fullscreen:
-                        self.full_dirty = True
+                data = get_lyrics(title, artist, album, duration, self.lyrics_sync, force=force)
+            except Exception:
+                data = None
             finally:
-                self._lyrics_fetching = False
+                if self._lyrics_fetching == key:
+                    self._lyrics_fetching = None
+            # Only apply if the user is still on the same track
+            if self.playing is playing_snapshot and self._lyrics_key == key:
+                if data is None:
+                    self.lyrics = {"source": "liriqo", "instrumental": False, "synced": False,
+                                   "has_word_sync": False, "plain": None, "lines": [],
+                                   "missing": True, "transient": True}
+                    self.set_status("Lyrics API unreachable - press R (lyrics panel) to retry", ttl=6)
+                else:
+                    self.lyrics = self._apply_romaji(strip_translation_lines(data, title, artist))
+                if self.lyrics_visible or self.lyrics_fullscreen:
+                    self.full_dirty = True
+                self._invalidate_lyrics_panel()
+                self.right_dirty = True
 
         threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def refresh_lyrics(self):
+        """R while the lyrics panel is open: drop the cached lyrics and fetch them again."""
+        if not self.enable_lyrics:
+            return
+        if not self.playing or not self.meta:
+            self.set_status("Nothing playing", ttl=3)
+            return
+        key = self._lyrics_key
+        if key:
+            delete_cached_lyrics(key)
+        self.lyrics = None
+        self.lyrics_scroll = 0
+        self.lyrics_scroll_manual = False
+        if not self._start_lyrics_fetch(force=True):
+            self.set_status("Lyrics need a title and artist tag", ttl=4)
+        else:
+            self.set_status("Refreshing lyrics…", ttl=3)
+        self._invalidate_lyrics_panel()
+        self.right_dirty = True
+        if self.lyrics_fullscreen:
+            self.full_dirty = True
+
+    @staticmethod
+    def _same_track(a, b) -> bool:
+        try:
+            if isinstance(a, StreamEntry) or isinstance(b, StreamEntry):
+                return a == b
+            return a.resolve() == b.resolve()
+        except Exception:
+            return a == b
+
+    def _schedule_lyrics_prefetch(self):
+        """Queue the other tracks of the current folder / playlist for lyrics prefetching."""
+        n = self.lyrics_prefetch_count
+        if not self.enable_lyrics or n <= 0 or not self.playing:
+            return
+        try:
+            tracks = self._autoplay_pool()
+        except Exception:
+            return
+        if not tracks:
+            return
+        idx = next((i for i, t in enumerate(tracks) if self._same_track(t, self.playing)), -1)
+        if self.shuffle:
+            rest = [t for t in tracks if not self._same_track(t, self.playing)]
+            random.shuffle(rest)
+        else:
+            rest = tracks[idx + 1:] + tracks[:max(idx, 0)] if idx >= 0 else list(tracks)
+        self._lyrics_prefetcher.schedule(rest[:n])
 
     def _apply_romaji(self, data: dict) -> dict:
         if not self.lyrics_romaji or not data:
@@ -3661,7 +3868,7 @@ method = pulse
             # Re-enable autoscroll whenever the panel is opened
             self.lyrics_scroll_manual = False
             self.lyrics_scroll = 0
-            if self.lyrics is None and self.playing:
+            if (self.lyrics is None or self.lyrics.get("transient")) and self.playing:
                 self._start_lyrics_fetch()
         self._invalidate_lyrics_panel()
         self.full_dirty = True
@@ -4189,7 +4396,9 @@ method = pulse
             return [pad_to_width(style(self.c_sub) + center(msg, w) + RESET, w)] + empty[1:]
 
         if data.get("instrumental") or data.get("missing"):
-            msg = "Instrumental" if data.get("instrumental") else "No lyrics found"
+            msg = ("Instrumental" if data.get("instrumental")
+                   else "Lyrics unavailable - press R to retry" if data.get("transient")
+                   else "No lyrics found - press R to retry")
             return [pad_to_width(style(self.c_sub) + center(msg, w) + RESET, w)] + empty[1:]
 
         lines = data.get("lines") or []
@@ -4465,6 +4674,7 @@ method = pulse
             f"{k}{lk}          {d}Toggle right panel: files ↔ lyrics (now {lyrics_state}){RESET}",
             f"{k}{fk}          {d}Full-screen lyrics (now {fs_state}; needs lyrics.fullscreen=true){RESET}",
             f"{k}↑ / ↓      {d}Scroll lyrics when the lyrics panel is open{RESET}",
+            f"{k}R          {d}Lyrics panel open: refresh (delete cache + fetch again){RESET}",
             f"{k}Ctrl+C     {d}Copy lyrics to clipboard (when lyrics panel is open){RESET}",
             f"{k}Ctrl+V     {d}Paste lyrics from clipboard (overrides API / cache){RESET}",
             f"{k}Delete     {d}Remove the selected stream playlist / track (confirm Y/N){RESET}",
@@ -4483,6 +4693,7 @@ method = pulse
             f"lyrics.romaji                   Japanese → romaji (needs pykakasi)",
             f"lyrics.sync    syllable | word | line | off   (default: word)",
             f"lyrics.copy_timestamps          Ctrl+C includes [mm:ss] stamps",
+            f"lyrics.prefetch_count           tracks of the folder to pre-fetch lyrics for (0 = off, default 25)",
             f"lyrics.fullscreen / key         full-screen lyrics mode",
             f"keybinds.shuffle / loop         keys to toggle shuffle / loop",
             f"playlists_name / add_playlist  stream folder name / key to add",
@@ -4861,6 +5072,8 @@ method = pulse
                 self._delete_lyrics()
             else:
                 self._delete_stream_item()
+        elif lyrics_nav and isinstance(k, str) and k.lower() == "r":
+            self.refresh_lyrics()
         elif isinstance(k, str) and len(k) == 1 and k.lower() == self.shuffle_key:
             if not lyrics_nav:
                 self.toggle_shuffle()
@@ -4925,6 +5138,10 @@ method = pulse
                     pass
             try:
                 self.stream_cache.stop()
+            except Exception:
+                pass
+            try:
+                self._lyrics_prefetcher.stop()
             except Exception:
                 pass
             self.mpv.terminate()
